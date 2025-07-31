@@ -5,54 +5,71 @@ GREEN='\033[0;32m'
 BLUE='\033[0;34m'
 NC='\033[0m'
 
-# check if 'uidmap' is installed
-if ! dpkg -s uidmap  &> /dev/null; then 
-  sudo apt install  -y uidmap
-fi
-
-echo -e "${GREEN} Prerequisites${NC}"
-
-# Subordinate uid/gid
-uid=$(grep "^$(whoami):" /etc/subuid | cut -d:  -f3)
-gid=$(grep "^$(whoami):" /etc/subgid | cut -d:  -f3)
-MIN_SUB=65536
-
-{ [ "$uid" -eq "$MIN_SUB" ] && [ "$gid" -eq "$MIN_SUB" ]; } ||  { echo "The subordinate UIDs/GIDs is incorrect"; exit 1; }
-
-# Install dbus-user-session
-if ! dpkg -l dbus-user-session &> /dev/null; then 
-  sudo apt-get install -y dbus-user-session 
-  echo "You must relogin."
-fi
-
-
 # CODENAME=$(grep CODENAME /etc/os-release | awk -F= '{print $2}')
 VERSION_ID=$(grep VERSION_ID /etc/os-release | awk -F= '{print $2}')
 DISTRIBUTION=$(grep ^ID /etc/os-release | awk -F= '{print $2}')
 
-# Installing fuse-overlayfs is recommended
-if [ "$DISTRIBUTION" = "debian" ] && [ "$VERSION_ID" = "11"  ]; then
- if ! dpkg -s fuse-overlayfs &> /dev/null; then 
-   sudo apt-get install -y fuse-overlayfs
-   echo "fuse-overlayfs installed in Debian 11"
- fi
-fi
 
-# Rootless docker requires version of slirp4netns greater than v0.4.0
-if ! dpkg -l slirp4netns &> /dev/null; then
-  sudo apt-get install -y slirp4netns
-  echo 'slirp4netns installed'
-fi
+DOCKER_SERVICE="docker.service"
+DOCKER_SOCKET="docker.socket"
 
+DOCKER_ROOTLESS_SETUPTOOL="/usr/bin/dockerd-rootless-setuptool.sh"
 
-echo -e "${GREEN} Install Docker${NC}"
+DOCKER_SOCKET_PATH="DOCKER_HOST=unix:///run/user/$(id -u $USER)/docker.sock"
+
+function print_header {
+  local text=$1
+  local line_length=65
+  local half=$(((line_length-1-${#text})/2))
+  local padding=$(printf "%0.1s" \#{1..65})
+  echo -e "${GREEN}##################################################################"
+  printf "%*.*s %s %*.*s\n" 0 "$half" "$padding" "$text" 0 "$half" "$padding"
+  echo -e "##################################################################${NC}"
+}
+
+function install_and_configure_prerequisites {
+  print_header "Prerequisites$"
+  # check if 'uidmap' is installed
+  if ! dpkg -s uidmap  &> /dev/null; then 
+    sudo apt install  -y uidmap
+  fi
+
+  # Subordinate uid/gid
+  local uid=$(grep "^$(whoami):" /etc/subuid | cut -d:  -f3)
+  local gid=$(grep "^$(whoami):" /etc/subgid | cut -d:  -f3)
+  MIN_SUBORDINATE=65536
+
+  { [ "$uid" -eq "$MIN_SUBORDINATE" ] && [ "$gid" -eq "$MIN_SUBORDINATE" ]; } ||  { echo "The subordinate UIDs/GIDs is incorrect"; exit 1; }
+
+  # Install dbus-user-session
+  if ! dpkg -s dbus-user-session &> /dev/null; then 
+    sudo apt-get install -y dbus-user-session 
+    echo "You must relogin."
+  fi
+
+  # Installing fuse-overlayfs is recommended
+  if [ "$DISTRIBUTION" = "debian" ] && [ "$VERSION_ID" = "11"  ]; then
+   if ! dpkg -s fuse-overlayfs &> /dev/null; then 
+     sudo apt-get install -y fuse-overlayfs
+     echo "fuse-overlayfs installed in Debian 11"
+   fi
+  fi
+
+  # Rootless docker requires version of slirp4netns greater than v0.4.0
+  if ! dpkg -l slirp4netns &> /dev/null; then
+    sudo apt-get install -y slirp4netns
+    echo 'slirp4netns installed'
+  fi
+}
+
 
 function disable_rootful_docker {
+  print_header "Disable Rootful Docker"
   docker_user=$(ps -o user= -p "$(systemctl show -p MainPID docker | cut -d= -f2)")
   if [ "$docker_user" = "root" ]; then
     sudo systemctl disable --now $DOCKER_SERVICE $DOCKER_SOCKET 
     sudo rm /var/run/docker.sock 
-    echo "No docker installed."
+    echo "Rootful docker disabled."
   else
     echo "There is no rootful docker running."
   fi
@@ -72,6 +89,7 @@ function post_install {
 }
 
 function install_docker {
+  print_header "Install Docker"
   # Install docker
   ## Uninstall old versions
   for pkg in docker.io docker-doc docker-compose podman-docker containerd runc; do sudo apt-get remove -y $pkg; done
@@ -106,47 +124,54 @@ function uninstall_docker {
   # sudo rm -rf /var/lib/containerd
 }
 
-# Disable docker if already exists
-DOCKER_SERVICE="docker.service"
-DOCKER_SOCKET="docker.socket"
-is_active=$(sudo systemctl is-enabled $DOCKER_SERVICE &> /dev/null)
-is_enabled=$(sudo systemctl is-active $DOCKER_SERVICE)
+function install_and_configure_rootless_docker {
+  print_header "Install Rootless Docker"
+  # Install rootless-docker
+  # Check if $DOCKER_ROOTLESS_SETUPTOOL exists. if not install it.
+  if [ ! -f $DOCKER_ROOTLESS_SETUPTOOL ]; then
+    sudo apt-get install -y docker-ce-rootless-extras
+  fi
+  # Set up a not-root user daemon
+  dockerd-rootless-setuptool.sh install
 
-if [ "$is_enabled" = "0" ] || [ "$is_active" = "0" ]; then
-  disable_rootful_docker
-else
-  install_docker
-  disable_rootful_docker
-fi
+  # Start docker service
+  systemctl --user start docker
 
-
-echo -e "${GREEN} Install Rootless Docker${NC}"
-
-# Install rootless-docker
-DOCKER_ROOTLESS_SETUPTOOL="/usr/bin/dockerd-rootless-setuptool.sh"
-# Check if $DOCKER_ROOTLESS_SETUPTOOL exists. if not install it.
-[ ! -f $DOCKER_ROOTLESS_SETUPTOOL ] && sudo apt-get install -y docker-ce-rootless-extras
-# Set up a not-root user daemon
-dockerd-rootless-setuptool.sh install
-
-# Start docker service
-systemctl --user start docker
-
-# Launch the daemon on system startup, enable the systemd service and lingering
-systemctl --user enable docker
-sudo loginctl enable-linger "$(whoami)"
+  # Launch the daemon on system startup, enable the systemd service and lingering
+  sudo systemctl --user enable docker
+  sudo loginctl enable-linger "$(whoami)"
 
 
-# [INFO] Make sure the following environment variable(s) are set (or add them to ~/.bashrc):
-BASHRC="$HOME/.bashrc"
-if ! grep -q '/usr/bin' "$BASHRC"; then
-  echo -e "\nexport PATH=/usr/bin:\$PATH" >> "$BASHRC"
-fi
+  # [INFO] Make sure the following environment variable(s) are set (or add them to ~/.bashrc):
+  BASHRC="$HOME/.bashrc"
+  if ! grep -q '/usr/bin' "$BASHRC"; then
+    echo -e "\nexport PATH=/usr/bin:\$PATH" >> "$BASHRC"
+  fi
 
-#[INFO] Some applications may require the following environment variable too:
-DOCKER_SOCKET_PATH="DOCKER_HOST=unix:///run/user/$(id -u $USER)/docker.sock"
-if ! grep -q "$DOCKER_SOCKET_PATH" "$BASHRC"; then
-  echo "export $DOCKER_SOCKET_PATH" >> "$BASHRC"
-fi
+  #[INFO] Some applications may require the following environment variable too:
+  if ! grep -q "$DOCKER_SOCKET_PATH" "$BASHRC"; then
+    echo "export $DOCKER_SOCKET_PATH" >> "$BASHRC"
+  fi
 
-source "$BASHRC"
+  source "$BASHRC"
+
+}
+
+
+function main {
+  # check if docker is install
+  # Disable docker if already exists
+  sudo systemctl is-enabled $DOCKER_SERVICE > /dev/null 2>&1
+  local is_enabled=$?
+  local is_active=$(sudo systemctl is-active $DOCKER_SERVICE)
+
+  if [ "$is_enabled" = "0" ] || [ "$is_active" = "active" ]; then
+    disable_rootful_docker
+  else
+    install_docker
+    disable_rootful_docker
+  fi
+  install_and_configure_rootless_docker
+}
+
+main
